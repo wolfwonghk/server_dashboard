@@ -1,0 +1,6 @@
+name,type,host,port
+PC1,http,192.168.0.11,80
+PC2,https,192.168.0.12,443
+FileServer,tcp,192.168.0.13,5001
+VM1,ping,192.168.0.14,8006
+

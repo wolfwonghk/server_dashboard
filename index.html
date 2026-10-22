@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SERVER STATUS MATRIX // 在線檢查</title>
+  <!-- 前端純 HTML/JS（DEVELOPMENT.md §5）：只 fetch /api/status 渲染，免 build、免 CDN、免框架 -->
+  <!-- 視覺：The Matrix 風（DASHBOARD_REQUIREMENTS.md §3）— 深黑底、螢光綠、終端機字型、字符雨、掃描線、發光面板、事件日誌 -->
+  <style>
+    :root {
+      --bg: #030605;
+      --green: #00ff66;
+      --green-dim: rgba(0, 255, 102, 0.55);
+      --green-faint: rgba(0, 255, 102, 0.14);
+      --up: #00ff66;
+      --down: #ff3b4e;
+      --warn: #ffd24a;
+      --text: #c8ffdc;
+      --muted: rgba(0, 255, 102, 0.45);
+      --panel: rgba(2, 24, 12, 0.55);
+      --border: rgba(0, 255, 102, 0.35);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { background: var(--bg); }
+    body {
+      background: transparent;
+      color: var(--text);
+      font-family: "SF Mono", ui-monospace, Menlo, Consolas, "Courier New",
+        "PingFang TC", "Noto Sans TC", monospace; /* 終端機字型為全局主字體 */
+      min-height: 100vh;
+      padding: 24px;
+      position: relative;
+      z-index: 1;
+    }
+    .mono { font-family: inherit; }
+
+    /* ---- 背景層：字符雨 canvas + 網格線 + CRT 掃描線 ---- */
+    #rain {
+      position: fixed; inset: 0;
+      width: 100vw; height: 100vh;
+      z-index: -2; opacity: 0.28; pointer-events: none;
+    }
+    .grid-bg {
+      position: fixed; inset: 0; z-index: -1; pointer-events: none;
+      background:
+        repeating-linear-gradient(0deg, rgba(0,255,102,0.05) 0 1px, transparent 1px 48px),
+        repeating-linear-gradient(90deg, rgba(0,255,102,0.05) 0 1px, transparent 1px 48px),
+        radial-gradient(ellipse at 50% 0%, rgba(0,255,102,0.06), transparent 65%);
+    }
+    .crt-overlay {
+      position: fixed; inset: 0; z-index: 40; pointer-events: none;
+      background: repeating-linear-gradient(0deg, rgba(0,0,0,0.22) 0 1px, transparent 1px 3px);
+      overflow: hidden;
+    }
+    .crt-overlay::after { /* 移動掃描亮線 */
+      content: ""; position: absolute; left: 0; right: 0; height: 90px;
+      top: -90px;
+      background: linear-gradient(180deg, transparent, rgba(0,255,120,0.10) 45%, rgba(160,255,190,0.22) 50%, rgba(0,255,120,0.10) 55%, transparent);
+      animation: scan 7s linear infinite;
+    }
+    @keyframes scan { from { top: -90px; } to { top: 100vh; } }
+    body.probing .crt-overlay::after { animation-duration: 1.4s; } /* 刷新中：掃描線加速 */
+
+    /* ---- 頂部 HUD ---- */
+    header {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 16px;
+      margin-bottom: 20px;
+    }
+    header h1 {
+      font-size: 20px; font-weight: 700; letter-spacing: 2px;
+      color: var(--green);
+      text-shadow: 0 0 10px rgba(0,255,102,0.65), 0 0 2px rgba(0,255,102,0.9);
+    }
+    header h1 .cursor { animation: blink 1.1s steps(1) infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .stats { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 12px; }
+    .stat {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      backdrop-filter: blur(3px);
+      -webkit-backdrop-filter: blur(3px);
+      padding: 5px 12px; letter-spacing: 1px; color: var(--green-dim);
+      box-shadow: 0 0 10px rgba(0,255,102,0.12), inset 0 0 12px rgba(0,255,102,0.05);
+    }
+    .stat b { color: var(--text); }
+    .stat .n-up { color: var(--up); text-shadow: 0 0 6px var(--up); }
+    .stat .n-down { color: var(--down); text-shadow: 0 0 6px var(--down); }
+    .toolbar { margin-left: auto; display: flex; gap: 12px; align-items: center; }
+    #refresh-btn {
+      background: rgba(0,255,102,0.10);
+      color: var(--green);
+      border: 1px solid var(--green);
+      border-radius: 2px;
+      padding: 8px 18px;
+      font-size: 13px; font-weight: 700; letter-spacing: 2px;
+      font-family: inherit;
+      cursor: pointer;
+      text-shadow: 0 0 6px rgba(0,255,102,0.6);
+      box-shadow: 0 0 12px rgba(0,255,102,0.25), inset 0 0 8px rgba(0,255,102,0.08);
+      transition: box-shadow 0.2s ease, background 0.2s ease;
+    }
+    #refresh-btn:hover:not(:disabled) {
+      background: rgba(0,255,102,0.22);
+      box-shadow: 0 0 20px rgba(0,255,102,0.5), inset 0 0 10px rgba(0,255,102,0.15);
+    }
+    #refresh-btn:disabled { opacity: 0.5; cursor: wait; }
+    .countdown { color: var(--muted); font-size: 12px; min-width: 96px; text-align: right; letter-spacing: 1px; }
+
+    /* ---- 錯誤橫幅 / 空資料 ---- */
+    .banner {
+      border: 1px solid var(--down);
+      background: rgba(255, 59, 78, 0.10);
+      backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+      color: var(--down);
+      padding: 12px 16px; margin-bottom: 16px;
+      font-size: 13px; letter-spacing: 1px;
+      box-shadow: 0 0 14px rgba(255,59,78,0.3), inset 0 0 14px rgba(255,59,78,0.08);
+    }
+    .empty {
+      border: 1px dashed var(--border);
+      color: var(--muted);
+      padding: 40px 16px; text-align: center; font-size: 13px; letter-spacing: 1px;
+      background: var(--panel);
+    }
+
+    /* ---- 卡片網格（響應式：桌面多列、620px 以下單列） ---- */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 14px;
+    }
+    @media (max-width: 620px) {
+      body { padding: 12px; }
+      .grid { grid-template-columns: 1fr; }
+      .toolbar { margin-left: 0; width: 100%; }
+      header h1 { font-size: 16px; letter-spacing: 1px; }
+      #rain { opacity: 0.16; } /* 窄屏降級：字符雨減弱 */
+    }
+
+    /* ---- 半透明面板 + 發光邊框卡片 ---- */
+    .card {
+      position: relative;
+      background: var(--panel);
+      backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 14px 16px;
+      display: flex; flex-direction: column; gap: 8px;
+      transition: border-color 0.3s ease, box-shadow 0.3s ease;
+    }
+    .card.up {
+      border-color: rgba(0,255,102,0.55);
+      box-shadow: 0 0 14px rgba(0,255,102,0.20), inset 0 0 18px rgba(0,255,102,0.04);
+    }
+    .card.down {
+      border-color: rgba(255,59,78,0.7);
+      background: rgba(40, 4, 10, 0.5);
+      box-shadow: 0 0 14px rgba(255,59,78,0.30), inset 0 0 18px rgba(255,59,78,0.06);
+    }
+    .card-top { display: flex; align-items: center; gap: 10px; }
+    .dot {
+      width: 12px; height: 12px; border-radius: 50%;
+      flex: none; transition: background 0.3s ease, box-shadow 0.3s ease;
+    }
+    .dot.up { background: var(--up); box-shadow: 0 0 10px var(--up), 0 0 20px rgba(0,255,102,0.5); }
+    .dot.down { background: var(--down); box-shadow: 0 0 10px var(--down), 0 0 20px rgba(255,59,78,0.5); }
+    .dot.unknown { background: var(--muted); }
+    .card-name {
+      font-weight: 700; font-size: 15px; letter-spacing: 1px;
+      text-shadow: 0 0 6px rgba(0,255,102,0.4);
+    }
+    .badge {
+      margin-left: auto; font-size: 10px; padding: 2px 8px;
+      border: 1px solid var(--border); color: var(--green-dim);
+      text-transform: uppercase; letter-spacing: 1px; border-radius: 2px;
+    }
+    .card-host { font-size: 13px; color: var(--green-dim); letter-spacing: 0.5px; }
+    .card-rows { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); letter-spacing: 1px; }
+    .state-tag { letter-spacing: 2px; font-weight: 700; }
+    .card.up .state-tag { color: var(--up); text-shadow: 0 0 6px var(--up); }
+    .card.down .state-tag { color: var(--down); text-shadow: 0 0 6px var(--down); }
+    .latency.ok { color: var(--up); text-shadow: 0 0 5px rgba(0,255,102,0.5); }
+    .latency.slow { color: var(--warn); text-shadow: 0 0 5px rgba(255,210,74,0.5); }
+    .latency.dead { color: var(--down); text-shadow: 0 0 5px rgba(255,59,78,0.5); }
+    body.probing .card { opacity: 0.72; } /* 刷新中：微降透明度（掃描線同時加速） */
+
+    /* ---- 狀態變更特效掛載點（renderCards 渲染後掛上 class） ---- */
+    .fx-glitch { animation: glitch 0.85s steps(2) 2; } /* UP→DOWN：紅閃/glitch/震動 */
+    @keyframes glitch {
+      0%   { transform: translate(0, 0); }
+      10%  { transform: translate(-4px, 2px); border-color: var(--down); box-shadow: 0 0 28px rgba(255,59,78,0.9), inset 0 0 24px rgba(255,59,78,0.25); }
+      20%  { transform: translate(4px, -2px); }
+      30%  { transform: translate(-3px, -2px); box-shadow: 0 0 22px rgba(255,59,78,0.75); }
+      40%  { transform: translate(3px, 2px); }
+      55%  { transform: translate(-2px, 1px); box-shadow: 0 0 30px rgba(255,59,78,0.9); }
+      70%  { transform: translate(2px, -1px); }
+      100% { transform: translate(0, 0); }
+    }
+    .fx-ripple { overflow: hidden; } /* DOWN→UP：綠色波紋掃描点亮 */
+    .fx-ripple::after {
+      content: ""; position: absolute; left: 50%; top: 50%;
+      width: 12px; height: 12px; border-radius: 50%;
+      background: radial-gradient(circle, rgba(0,255,120,0.75), rgba(0,255,120,0.25) 55%, transparent 72%);
+      transform: translate(-50%, -50%) scale(0);
+      animation: ripple 1.1s ease-out 1;
+      pointer-events: none;
+    }
+    @keyframes ripple {
+      from { transform: translate(-50%, -50%) scale(0); opacity: 1; }
+      to   { transform: translate(-50%, -50%) scale(48); opacity: 0; }
+    }
+
+    /* ---- 載入中骨架 ---- */
+    .skeleton { overflow: hidden; min-height: 96px; }
+    .skeleton > * { visibility: hidden; }
+    .skeleton::before { content: none; }
+    .skeleton::after {
+      content: ""; position: absolute; inset: 0; z-index: 2;
+      background: linear-gradient(90deg, transparent, rgba(0,255,102,0.10), transparent);
+      animation: shimmer 1.2s infinite;
+    }
+    @keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+    /* ---- 終端機風事件日誌區（新開發：前端比對前後輪 up 推導 Transition） ---- */
+    .logpanel {
+      margin-top: 22px;
+      border: 1px solid var(--border);
+      background: rgba(1, 14, 7, 0.72);
+      backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+      box-shadow: 0 0 14px rgba(0,255,102,0.15), inset 0 0 20px rgba(0,255,102,0.04);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .log-head {
+      padding: 7px 12px; font-size: 11px; letter-spacing: 2px;
+      color: var(--green);
+      border-bottom: 1px solid var(--border);
+      background: rgba(0,255,102,0.07);
+      text-shadow: 0 0 6px rgba(0,255,102,0.5);
+    }
+    #event-log {
+      padding: 10px 12px;
+      height: 180px; overflow-y: auto;
+      font-size: 12px; line-height: 1.7; letter-spacing: 0.5px;
+      scrollbar-width: thin; scrollbar-color: var(--green-faint) transparent;
+    }
+    #event-log::-webkit-scrollbar { width: 6px; }
+    #event-log::-webkit-scrollbar-thumb { background: var(--green-faint); }
+    .logline { color: var(--green-dim); white-space: pre-wrap; word-break: break-all; }
+    .logline .log-ts { color: var(--muted); }
+    .logline.sys { color: rgba(0,255,102,0.75); }
+    .logline.down { color: #ff8894; text-shadow: 0 0 5px rgba(255,59,78,0.4); }
+    .logline.up { color: #7dffb0; text-shadow: 0 0 5px rgba(0,255,102,0.4); }
+    .logline.warn { color: var(--warn); }
+
+    footer { margin-top: 20px; color: var(--muted); font-size: 11px; letter-spacing: 1px; }
+    footer b { color: var(--green-dim); }
+
+    /* ---- 狀態變更特效庫：每種事件類別一種視覺；僅用 transform/box-shadow/background/opacity，不造成版面位移 ---- */
+    /* restarting：青-琥珀雙色脈衝 + 向下掃描帶 + 微位移 glitch */
+    .fx-reboot { overflow: hidden; animation: reboot 1.2s steps(2) 1; }
+    .fx-reboot::after {
+      content: ""; position: absolute; left: 0; right: 0; height: 40%; top: -40%;
+      background: linear-gradient(180deg, transparent, rgba(85,224,255,0.30), rgba(255,210,74,0.25), transparent);
+      animation: reboot-scan 1.2s ease-in-out 1; pointer-events: none;
+    }
+    @keyframes reboot {
+      0%   { transform: none; }
+      10%  { transform: translate(-3px, 1px); border-color: #55e0ff; box-shadow: 0 0 26px rgba(85,224,255,0.85), inset 0 0 20px rgba(85,224,255,0.18); }
+      25%  { transform: translate(3px, -1px); }
+      40%  { transform: translate(-2px, -1px); border-color: var(--warn); box-shadow: 0 0 26px rgba(255,210,74,0.85), inset 0 0 20px rgba(255,210,74,0.16); }
+      55%  { transform: translate(2px, 1px); }
+      70%  { transform: translate(-1px, 0); border-color: #55e0ff; box-shadow: 0 0 22px rgba(85,224,255,0.7); }
+      100% { transform: none; }
+    }
+    @keyframes reboot-scan { from { top: -40%; } to { top: 100%; } }
+
+    /* warning：琥珀呼吸色脈衝（純發光，不位移） */
+    .fx-pulse { animation: pulse-warn 0.9s ease-in-out 3; }
+    @keyframes pulse-warn {
+      0%, 100% { border-color: var(--border); box-shadow: 0 0 14px rgba(0,255,102,0.20); }
+      50% { border-color: var(--warn); box-shadow: 0 0 24px rgba(255,210,74,0.75), inset 0 0 18px rgba(255,210,74,0.12); }
+    }
+
+    /* error（狀態震盪/flap 或後端故障）：強烈紅白爆閃 + 較大振幅震動 */
+    .fx-alarm { animation: alarm 1.5s steps(2) 2; }
+    @keyframes alarm {
+      0%   { transform: none; }
+      8%   { transform: translate(-6px, 3px); border-color: #fff; box-shadow: 0 0 34px rgba(255,59,78,1), inset 0 0 28px rgba(255,59,78,0.35); }
+      16%  { transform: translate(6px, -3px); border-color: var(--down); }
+      24%  { transform: translate(-5px, -2px); box-shadow: 0 0 30px rgba(255,255,255,0.8), inset 0 0 24px rgba(255,59,78,0.25); }
+      32%  { transform: translate(5px, 2px); }
+      48%  { transform: translate(-3px, 2px); box-shadow: 0 0 34px rgba(255,59,78,0.95), inset 0 0 28px rgba(255,59,78,0.3); }
+      64%  { transform: translate(3px, -2px); }
+      80%  { transform: translate(-2px, 1px); box-shadow: 0 0 26px rgba(255,59,78,0.8); }
+      100% { transform: none; }
+    }
+
+    /* ---- Toast 通知：固定右下角疊層（position:fixed，不參與文件流，絕不推擠版面）；自動消失＋點擊關閉 ---- */
+    #toast-stack {
+      position: fixed; right: 16px; bottom: 16px; z-index: 60;
+      display: flex; flex-direction: column; gap: 8px;
+      max-width: min(360px, calc(100vw - 32px));
+      pointer-events: none;
+    }
+    .toast {
+      pointer-events: auto; cursor: pointer;
+      display: flex; align-items: center; gap: 10px;
+      border: 1px solid var(--border); background: rgba(1, 18, 9, 0.92);
+      backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+      padding: 9px 13px; border-radius: 3px;
+      font-size: 12px; letter-spacing: 1px; color: var(--text);
+      box-shadow: 0 0 16px rgba(0,255,102,0.18);
+      animation: toast-in 0.28s ease-out 1;
+    }
+    .toast .t-ico { font-size: 14px; flex: none; }
+    .toast.up     { border-color: rgba(0,255,102,0.7);  color: var(--up);    text-shadow: 0 0 6px rgba(0,255,102,0.6); }
+    .toast.down   { border-color: rgba(255,59,78,0.8);  color: #ff8894;      text-shadow: 0 0 6px rgba(255,59,78,0.6); }
+    .toast.warn   { border-color: rgba(255,210,74,0.8); color: var(--warn);  text-shadow: 0 0 6px rgba(255,210,74,0.6); }
+    .toast.restart { border-color: rgba(85,224,255,0.8); color: #9feaff;     text-shadow: 0 0 6px rgba(85,224,255,0.6); }
+    .toast.error  { border-color: #ff3b4e; color: #ffb3ba; background: rgba(48, 4, 12, 0.92); text-shadow: 0 0 6px rgba(255,59,78,0.7); }
+    .toast.hide { animation: toast-out 0.25s ease-in 1 forwards; }
+    @keyframes toast-in  { from { transform: translateX(110%); opacity: 0; } to { transform: none; opacity: 1; } }
+    @keyframes toast-out { from { transform: none; opacity: 1; } to { transform: translateX(110%); opacity: 0; } }
+
+    /* ---- 日誌高亮：新事件行入列時閃過一波背景色（純 background，不動版面） ---- */
+    .logline.flash { animation: log-flash 1.4s ease-out 1; }
+    @keyframes log-flash { from { background: rgba(0,255,102,0.22); } to { background: transparent; } }
+    .logline.down.flash, .logline.error.flash { animation-name: log-flash-down; }
+    @keyframes log-flash-down { from { background: rgba(255,59,78,0.28); } to { background: transparent; } }
+    .logline.warn.flash { animation-name: log-flash-warn; }
+    @keyframes log-flash-warn { from { background: rgba(255,210,74,0.25); } to { background: transparent; } }
+    .logline.restart.flash { animation-name: log-flash-cyan; }
+    @keyframes log-flash-cyan { from { background: rgba(85,224,255,0.22); } to { background: transparent; } }
+    .logline.restart { color: #7fe8ff; text-shadow: 0 0 5px rgba(85,224,255,0.4); }
+    .logline.error { color: #ff6b78; font-weight: 700; text-shadow: 0 0 6px rgba(255,59,78,0.6); }
+
+    @media (max-width: 620px) { #toast-stack { right: 12px; left: 12px; max-width: none; } }
+
+    /* ---- 動態偏好降低：關閉所有動畫（字符雨另於 JS 停用） ---- */
+    @media (prefers-reduced-motion: reduce) {
+      .crt-overlay::after, .skeleton::after, header h1 .cursor { animation: none !important; }
+      .fx-glitch, .fx-ripple::after, .fx-reboot, .fx-reboot::after, .fx-pulse, .fx-alarm { animation: none !important; }
+      .toast, .toast.hide { animation: none !important; }
+      .logline.flash { animation: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="rain" aria-hidden="true"></canvas>
+  <div class="grid-bg" aria-hidden="true"></div>
+  <div class="crt-overlay" aria-hidden="true"></div>
+
+  <header>
+    <h1>&gt;_ SERVER_STATUS_MATRIX<span class="cursor">▊</span></h1>
+    <div class="stats">
+      <span class="stat">UP <b class="n-up" id="stat-up">–</b></span>
+      <span class="stat">DOWN <b class="n-down" id="stat-down">–</b></span>
+      <span class="stat">TOTAL <b id="stat-total">–</b></span>
+      <span class="stat">REFRESH <b id="stat-refreshed">--:--:--</b></span>
+    </div>
+    <div class="toolbar">
+      <span class="countdown" id="countdown"></span>
+      <button id="refresh-btn">[ REFRESH ]</button>
+    </div>
+  </header>
+
+  <div id="banner"></div>
+  <div id="content"></div>
+
+  <section class="logpanel">
+    <div class="log-head">▚ EVENT_LOG — 狀態變更記錄 ▞</div>
+    <div id="event-log" aria-live="polite"></div>
+  </section>
+
+  <footer>
+    自動刷新 <b>5s</b> · 探測 timeout <b>20s</b>（後端並行執行）·
+    啟動：<span class="mono">python3 server.py 8000</span> · 清單：<span class="mono">servers.csv</span>
+  </footer>
+
+  <!-- Toast 通知層：fixed 定位不佔文件流，狀態變更事件即時彈出 -->
+  <div id="toast-stack" role="status" aria-live="polite"></div>
+
+  <script>
+    "use strict";
+    // ---- 固定參數（DEVELOPMENT.md §4/§6） ----
+    const REFRESH_INTERVAL_MS = 5000; // §6 前端每 5 秒 fetch /api/status
+    const API_STATUS = "/api/status"; // §5 後端探測端點
+    const API_TIMEOUT_MS = 8000;      // 前端 fetch 上限（後端探測 2s + 排程餘量）
+    const LOG_MAX_LINES = 200;        // 事件日誌保留上限
+    // ---- 狀態變更事件類別（online/offline/restarting/warning/error）之推導參數 ----
+    const RESTART_WINDOW_MS = 15000;  // DOWN→UP 間隔 < 此值 => 判定 restarting（快速重啟）
+    const FLAP_WINDOW_MS = 60000;     // 震盪統計時間窗
+    const FLAP_THRESHOLD = 3;         // 窗內狀態翻轉 >= 3 次 => 判定 error（狀態震盪）
+    const WARN_RTT_MS = 500;          // up 但延遲 > 此閾值 => 判定 warning（與 .latency dead 同閾值）
+    const TOAST_MAX = 4;              // 同屏 toast 上限（超出擠掉最舊一條）
+    const TOAST_LIFE_MS = 4500;       // toast 自動消失時間
+    const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    const el = (id) => document.getElementById(id);
+    const grid = el("content");
+    const banner = el("banner");
+    const btn = el("refresh-btn");
+    const logEl = el("event-log");
+
+    let timer = null;         // setInterval，手動刷新會重置
+    let nextRefreshAt = null;
+    let loading = false;
+    let probing = false;      // 供字符雨讀取：刷新中加速下落
+    let observed = null;      // 上一輪 name -> up（API 無事件流，前端自行比對推導 Transition）
+    let hist = Object.create(null); // name -> { ts:[狀態翻轉時間戳], downAt, warned }：供 restarting/error/warning 分類
+    let lastErrorToast = false;     // ok→error 跳變只提示一次，避免每輪重試洗版
+
+    const fmtTime = (d) => d.toLocaleTimeString("zh-TW", { hour12: false });
+    const latencyClass = (ms) => (ms == null ? "dead" : ms < 50 ? "ok" : ms <= 500 ? "slow" : "dead");
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, (c) =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    // ---- 終端機風事件日誌（時間戳＋名稱＋舊→新） ----
+    function logEvent(kind, html) {
+      const line = document.createElement("div");
+      line.className = "logline " + kind + " flash"; // 新行入列閃過一波背景高亮
+      line.innerHTML = `<span class="log-ts">[${fmtTime(new Date())}]</span> ${html}`;
+      line.addEventListener("animationend", () => line.classList.remove("flash"), { once: true });
+      logEl.appendChild(line);
+      while (logEl.childElementCount > LOG_MAX_LINES) logEl.removeChild(logEl.firstChild);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    // ---- Toast 通知：右下角 fixed 疊層，四類事件配色區分；自動消失 + 點擊關閉，不佔版面 ----
+    const toastStack = el("toast-stack");
+    const TOAST_META = {
+      online:     { ico: "✔",  cls: "up" },
+      offline:    { ico: "✖",  cls: "down" },
+      restarting: { ico: "↻",  cls: "restart" },
+      warning:    { ico: "⚠",  cls: "warn" },
+      error:      { ico: "⛔", cls: "error" },
+    };
+    function toast(kind, text) {
+      const meta = TOAST_META[kind] || TOAST_META.error;
+      while (toastStack.childElementCount >= TOAST_MAX) toastStack.firstElementChild.remove();
+      const t = document.createElement("div");
+      t.className = `toast ${meta.cls}`;
+      t.innerHTML = `<span class="t-ico">${meta.ico}</span><span>${text}</span>`;
+      const close = () => {
+        t.classList.add("hide");
+        setTimeout(() => t.remove(), REDUCED_MOTION ? 0 : 300);
+      };
+      t.addEventListener("click", close);
+      toastStack.appendChild(t);
+      setTimeout(close, TOAST_LIFE_MS);
+    }
+
+    // ---- 事件 → 日誌樣式 / 日誌文字 / toast 文字（五種事件類別的統一映射） ----
+    function eventLogClass(ev) {
+      return ev.kind === "warning" ? "warn"
+        : ev.kind === "restarting" ? "restart"
+        : ev.kind === "error" ? "error"
+        : ev.to === "DOWN" ? "down" : "up";
+    }
+    function eventLogText(ev) {
+      switch (ev.kind) {
+        case "warning":    return `LATENCY WARNING :: ${esc(ev.name)} rtt=${ev.rtt}ms > ${WARN_RTT_MS}ms ⚠`;
+        case "restarting": return `STATE TRANSITION :: ${esc(ev.name)} DOWN → UP ↻ [RESTARTING · ${ev.gapS}s 內恢復]`;
+        case "error":      return `STATE TRANSITION :: ${esc(ev.name)} ${ev.from} → ${ev.to} ⛔ [FLAPPING · ${ev.flaps} 次/${FLAP_WINDOW_MS / 1000}s]`;
+        default:           return `STATE TRANSITION :: ${esc(ev.name)} ${ev.from} → ${ev.to} ${ev.to === "DOWN" ? "✖ [OFFLINE]" : "✔ [ONLINE]"}`;
+      }
+    }
+    function toastText(ev) {
+      switch (ev.kind) {
+        case "warning":    return `WARNING :: ${esc(ev.name)} 延遲劣化 rtt=${ev.rtt}ms`;
+        case "restarting": return `RESTARTING :: ${esc(ev.name)} 快速重啟（${ev.gapS}s 內恢復）`;
+        case "error":      return `ERROR :: ${esc(ev.name)} 狀態震盪（${ev.flaps} 次/${FLAP_WINDOW_MS / 1000}s）`;
+        case "offline":    return `OFFLINE :: ${esc(ev.name)} 已離線`;
+        default:           return `ONLINE :: ${esc(ev.name)} 恢復上線`;
+      }
+    }
+
+    // ---- 狀態變更推導：比對前一輪與本輪的 up 欄位（DASHBOARD_REQUIREMENTS.md §2） ----
+    function deriveTransitions(results) {
+      const events = [];
+      if (observed === null) {
+        const up = results.filter((r) => r.up).length;
+        logEvent("sys", `BASELINE SNAPSHOT :: ${results.length} NODES · ${up} UP / ${results.length - up} DOWN`);
+      } else {
+        const names = new Set(results.map((r) => r.name));
+        for (const old of Object.keys(observed)) {
+          if (!names.has(old)) {
+            logEvent("sys", `NODE DISCONNECTED :: ${esc(old)} 已從清單移除`);
+            delete hist[old];
+          }
+        }
+        for (const r of results) {
+          if (!(r.name in observed)) {
+            logEvent("sys", `NODE LINK ESTABLISHED :: ${esc(r.name)} 初始=${r.up ? "UP" : "DOWN"}`);
+            continue;
+          }
+          const was = observed[r.name];
+          if (was !== !!r.up) {
+            const to = r.up ? "UP" : "DOWN";
+            events.push({ name: r.name, from: was ? "UP" : "DOWN", to, ...classifyTransition(r.name, to, Date.now()) });
+          }
+        }
+      }
+      // 延遲劣化偵測（邊緣觸發）：up 且 rtt 越過閾值 => warning，一個劣化週期只報一次
+      for (const w of deriveLatencyWarnings(results)) {
+        events.push({ name: w.name, kind: "warning", rtt: w.rtt, from: "UP", to: "UP" });
+      }
+      observed = Object.fromEntries(results.map((r) => [r.name, !!r.up]));
+      return events;
+    }
+
+    // 依時間窗把 UP↔DOWN 翻轉分類成事件類別：
+    //   DOWN→UP 且距上次 DOWN < RESTART_WINDOW_MS => restarting
+    //   UP→DOWN 且窗內翻轉數達 FLAP_THRESHOLD      => error（狀態震盪）
+    //   其餘：UP→DOWN => offline、DOWN→UP => online
+    function classifyTransition(name, to, now) {
+      const h = hist[name] || (hist[name] = { ts: [], downAt: null, warned: false });
+      h.ts.push(now);
+      h.ts = h.ts.filter((t) => now - t <= FLAP_WINDOW_MS);
+      if (to === "DOWN") {
+        h.downAt = now;
+        return { kind: h.ts.length >= FLAP_THRESHOLD ? "error" : "offline", flaps: h.ts.length };
+      }
+      const gapMs = h.downAt != null ? now - h.downAt : null;
+      if (gapMs != null && gapMs <= RESTART_WINDOW_MS) return { kind: "restarting", gapS: Math.max(1, Math.round(gapMs / 1000)) };
+      return { kind: "online", flaps: h.ts.length };
+    }
+
+    function deriveLatencyWarnings(results) {
+      const warns = [];
+      for (const r of results) {
+        const h = hist[r.name] || (hist[r.name] = { ts: [], downAt: null, warned: false });
+        const bad = !!r.up && r.rtt_ms != null && r.rtt_ms > WARN_RTT_MS;
+        if (bad && !h.warned) warns.push({ name: r.name, rtt: Math.round(r.rtt_ms) });
+        h.warned = bad; // 延遲回穩或轉 DOWN 後重新武裝，下次劣化再報
+      }
+      return warns;
+    }
+
+    // ---- 畫面狀態：loading 骨架 / error 橫幅 / empty 提示 / ready 卡片 ----
+    function renderSkeleton() {
+      grid.className = "grid";
+      grid.innerHTML = Array.from({ length: 6 }, () =>
+        '<div class="card skeleton"><div class="card-top"></div><div class="card-host mono">&gt;··········</div><div class="card-rows"></div></div>'
+      ).join("");
+    }
+
+    function renderError(message) {
+      banner.innerHTML = `<div class="banner">⚠ SIGNAL LOST :: 無法取得探測結果 — ${esc(message)}</div>`;
+      if (loading) { grid.className = "grid"; grid.innerHTML = ""; } // 骨架留給首載；重試失敗保留既有卡片
+      // 後端故障也是狀態變更事件：ok→error 跳變才發 toast＋日誌，避免每 5s 重試輪洗版
+      if (!lastErrorToast) {
+        lastErrorToast = true;
+        logEvent("error", `SYSTEM ERROR :: SIGNAL LOST — ${esc(message)}`);
+        toast("error", "ERROR :: SIGNAL LOST 無法取得探測結果");
+      }
+    }
+
+    function renderEmpty() {
+      banner.innerHTML = "";
+      grid.className = "";
+      grid.innerHTML =
+        '<div class="empty">servers.csv 沒有可用的伺服器列。<br>請在檔案中加上「name,type,host,port」格式的條目後重新整理頁面。</div>';
+      if (observed !== null) { logEvent("warn", "NODE LIST EMPTY :: servers.csv 無可用條目"); observed = null; }
+    }
+
+    function renderCards(results, events) {
+      banner.innerHTML = "";
+      grid.className = "grid";
+      if (loading) { grid.innerHTML = ""; } // 首載結束前不顯示半套資料
+      grid.innerHTML = results.map((r) => {
+        const state = r.up ? "up" : "down";
+        const checked = r.checked_at ? fmtTime(new Date(r.checked_at)) : "--:--:--";
+        const latency = r.up && r.rtt_ms != null
+          ? ` · <span class="latency mono ${latencyClass(r.rtt_ms)}">${Math.round(r.rtt_ms)} ms</span>` : "";
+        return `<div class="card ${state}">
+          <div class="card-top"><span class="dot ${state}"></span>
+            <span class="card-name">${esc(r.name)}</span>
+            <span class="badge">${esc(r.type)}</span></div>
+          <div class="card-host mono">${esc(r.target)}</div>
+          <div class="card-rows">
+            <span><span class="state-tag">${r.up ? "UP" : "DOWN"}</span>${latency}</span>
+            <span class="mono">檢查 ${esc(checked)}</span>
+          </div></div>`;
+      }).join("");
+
+      // ---- 特效掛載點：renderCards 渲染後依事件類別掛 class，animationend 即移除 ----
+      // online 綠波紋、offline 紅 glitch、restarting 青琥珀掃描色脈衝、warning 琥珀呼吸、error 紅白爆閃
+      // （prefers-reduced-motion 時不掛載；全部只用 transform/box-shadow，不造成版面位移）
+      if (!REDUCED_MOTION && events.length) {
+        const FX_CLASS = { online: "fx-ripple", offline: "fx-glitch", restarting: "fx-reboot", warning: "fx-pulse", error: "fx-alarm" };
+        const idx = new Map(results.map((r, i) => [r.name, i]));
+        for (const ev of events) {
+          const card = grid.children[idx.get(ev.name)];
+          if (!card) continue;
+          const cls = FX_CLASS[ev.kind] || (ev.to === "DOWN" ? "fx-glitch" : "fx-ripple");
+          card.classList.add(cls);
+          card.addEventListener("animationend", () => card.classList.remove(cls), { once: true });
+        }
+      }
+    }
+
+    function updateStats(results) {
+      el("stat-up").textContent = results.filter((r) => r.up).length;
+      el("stat-down").textContent = results.filter((r) => !r.up).length;
+      el("stat-total").textContent = results.length;
+      el("stat-refreshed").textContent = fmtTime(new Date());
+    }
+
+    // ---- 探測重抓：/api/status 由後端平行跑全部探測（§5） ----
+    async function refreshAll() {
+      if (loading) return; // 上一輪還沒跑完就跳過本輪
+      loading = true; probing = true;
+      btn.disabled = true;
+      document.body.classList.add("probing");
+      grid.classList.add("probing");
+      if (grid.querySelector(".card") === null && banner.textContent === "") renderSkeleton();
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), API_TIMEOUT_MS);
+      try {
+        const res = await fetch(`${API_STATUS}?t=${Date.now()}`, { signal: ctrl.signal });
+        const data = await res.json();
+        if (!res.ok) {
+          renderError((data && data.error) || `HTTP ${res.status}`);
+        } else if (!Array.isArray(data)) {
+          renderError(`未預期的回應格式：${JSON.stringify(data).slice(0, 120)}`);
+        } else if (data.length === 0) {
+          renderEmpty();
+          updateStats([]);
+        } else {
+          lastErrorToast = false; // 訊號恢復：重新武裝 error 提示
+          const events = deriveTransitions(data);
+          renderCards(data, events);
+          updateStats(data);
+          for (const ev of events) {
+            logEvent(eventLogClass(ev), eventLogText(ev)); // 日誌高亮（含類型配色）
+            toast(ev.kind, toastText(ev));                 // toast 通知
+          }
+        }
+      } catch (err) {
+        renderError(err && err.name === "AbortError" ? `請求逾時（>${API_TIMEOUT_MS / 1000}s）` : String(err.message || err));
+      } finally {
+        clearTimeout(to);
+        loading = false; probing = false;
+        btn.disabled = false;
+        document.body.classList.remove("probing");
+        grid.classList.remove("probing");
+      }
+    }
+
+    // ---- §6 自動 5 秒 + 手動重置計時器 ----
+    function scheduleAuto() {
+      if (timer) clearInterval(timer);
+      timer = setInterval(refreshAll, REFRESH_INTERVAL_MS);
+      nextRefreshAt = Date.now() + REFRESH_INTERVAL_MS;
+    }
+
+    btn.addEventListener("click", () => {
+      refreshAll();
+      scheduleAuto();
+    });
+
+    setInterval(() => {
+      if (nextRefreshAt == null) return;
+      const s = Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000));
+      el("countdown").textContent = loading ? "探測中…" : `${s}s 後自動刷新`;
+    }, 1000);
+
+    // ---- 背景字符雨（原生 JS canvas，免套件；prefers-reduced-motion 時不啟動） ----
+    (function matrixRain() {
+      if (REDUCED_MOTION) return;
+      const cv = el("rain");
+      const ctx = cv.getContext("2d");
+      const chars = "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン0123456789<>[]{}=+*#";
+      const FS = 16;
+      let cols = 0, drops = [];
+      function resize() {
+        cv.width = window.innerWidth; cv.height = window.innerHeight;
+        cols = Math.ceil(cv.width / FS);
+        drops = Array.from({ length: cols }, () => ({ y: Math.random() * cv.height, speed: 40 + Math.random() * 90 }));
+      }
+      window.addEventListener("resize", resize);
+      resize();
+      let last = performance.now();
+      function frame(now) {
+        const dt = Math.min(0.1, (now - last) / 1000); last = now;
+        ctx.fillStyle = "rgba(3, 6, 5, 0.14)";
+        ctx.fillRect(0, 0, cv.width, cv.height);
+        ctx.font = FS + "px monospace";
+        const boost = probing ? 2.2 : 1; // 刷新中：字符雨加速擾動
+        for (let i = 0; i < cols; i++) {
+          const d = drops[i];
+          d.y += d.speed * boost * dt;
+          if (d.y > cv.height + FS) { d.y = -FS; d.speed = 40 + Math.random() * 90; }
+          const ch = chars[(Math.random() * chars.length) | 0];
+          ctx.fillStyle = Math.random() < 0.03 ? "rgba(190,255,215,0.95)" : "rgba(0,255,102,0.40)";
+          ctx.fillText(ch, i * FS, d.y);
+        }
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+    })();
+
+    window.__fx = { logEvent, toast, classifyTransition, deriveLatencyWarnings }; // QA/主控台除錯鉤子：手動觸發特效與事件
+
+    renderSkeleton();
+    refreshAll();
+    scheduleAuto();
+  </script>
+</body>
+</html>
